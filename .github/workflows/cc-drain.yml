@@ -64,3 +64,60 @@ jobs:
           path: /tmp/warc_part_${{ env.SHARD }}.db
           retention-days: 7
           if-no-files-found: ignore
+
+  merge:
+    # Runs after the legs — even if some failed; artifacts from successful legs persist.
+    needs: drain
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests duckdb blake3
+      - name: Download part DBs from this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/warc-parts
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern "warc-part-*" --dir /tmp/warc-parts
+          find /tmp/warc-parts -name '*.db' | wc -l
+      - name: Seed DB from rolling release
+        run: |
+          mkdir -p data
+          if curl -fsSL -o data/kilimall.db.zip "https://github.com/${{ github.repository }}/releases/download/live-latest/kilimall.db.zip"; then
+            python -c "import zipfile; zipfile.ZipFile('data/kilimall.db.zip').extractall('data')" && rm data/kilimall.db.zip
+            echo "seeded from rolling release"
+          else
+            echo "no prior DB — merge creates schema"
+          fi
+      - name: Merge parts into kilimall.db
+        run: python scripts/warc_merge.py --part-dir /tmp/warc-parts
+      - name: Backfill categories from CC breadcrumbs
+        run: python scripts/backfill_categories.py
+      - name: Publish enriched live-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          [ -s data/kilimall.db ] || { echo "[guard] DB missing"; exit 1; }
+          mkdir -p data/cold
+          python - <<'PY'
+          import os, sqlite3
+          live, cold = 'data/kilimall.db', 'data/cold/kilimall.db'
+          s = sqlite3.connect(live); d = sqlite3.connect(cold)
+          s.backup(d); d.execute("PRAGMA wal_checkpoint(TRUNCATE)"); d.close(); s.close()
+          PY
+          (cd data/cold && python -c "import zipfile; zipfile.ZipFile('../kilimall.db.zip','w',zipfile.ZIP_DEFLATED).write('kilimall.db')")
+          cd data && cp "snapshot-$(date +%F).parquet" kilimall-live-latest.parquet 2>/dev/null || true
+          sha256sum kilimall.db.zip kilimall-live-latest.parquet 2>/dev/null | sed 's/ .*\///' > SHA256SUMS || true
+          if gh release view live-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then :; else
+            gh release create live-latest --repo "$GITHUB_REPOSITORY" --title 'Live dataset (rolling)' --prerelease \
+              --notes 'Rolling live dataset (live delta + Common Crawl harvest).'
+          fi
+          gh release upload live-latest data/kilimall.db.zip kilimall-live-latest.parquet SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
