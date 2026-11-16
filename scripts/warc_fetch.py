@@ -24,6 +24,40 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from kilimall_incremental import parse_product, record  # noqa: E402
 
+import re as _re
+
+RE_OG_TITLE = _re.compile(r'<meta property="og:title" content="([^"]+)"', _re.S)
+RE_OG_AMOUNT = _re.compile(r'og:product:price:amount" content="([\d.]+)"')
+RE_OG_CURRENCY = _re.compile(r'og:product:price:currency" content="([A-Za-z]{3})"')
+RE_OG_DESC = _re.compile(r'<meta (?:name|property)="og:description" content="([^"]+)"', _re.S)
+RE_SLUG_ID = _re.compile(r'/listing/(\d+)-')
+
+
+def parse_legacy(html, url=""):
+    """Pre-2025 storefront: client-rendered; product data lives in OpenGraph meta."""
+    title = (RE_OG_TITLE.search(html) or [None, ""])[1]
+    amount = (RE_OG_AMOUNT.search(html) or [None, ""])[1]
+    currency = (RE_OG_CURRENCY.search(html) or [None, "KES"])[1]
+    desc_m = RE_OG_DESC.search(html)
+    try:
+        price = float(amount) if amount else None
+    except (TypeError, ValueError):
+        price = None
+    m = RE_SLUG_ID.search(url)
+    guid = m.group(1) if m else ""
+    return {
+        "guid": guid,
+        "title": title.strip()[:500],
+        "price": price,
+        "currency": currency or "KES",
+        "url": url or "",
+        "brand": "",
+        "availability": "unknown",
+        "item_condition": "",
+        "description": (desc_m.group(1).strip()[:2000] if desc_m else ""),
+        "category": "",  # breadcrumb only exists in current-era ld+json
+    }
+
 CC = "https://data.commoncrawl.org/"
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) kilimall-archive-miner/0.2 (+contact: research)"}
 SCHEMA = """
@@ -75,11 +109,14 @@ def worker(sh, rows, db_path, delay):
             time.sleep(delay)
             continue
         p = parse_product(html)
-        if not p:
-            print(f"  [no JSON-LD] {url}", flush=True)
-            time.sleep(delay)
-            continue
-        r_ = record(p)
+        if p:
+            r_ = record(p)
+        else:
+            r_ = parse_legacy(html, url)
+            if not r_["title"] and r_["price"] is None:
+                print(f"  [no product data (ld+json or OG)] {url}", flush=True)
+                time.sleep(delay)
+                continue
         with LOCK:
             db = sqlite3.connect(db_path)
             db.execute(
