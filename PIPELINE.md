@@ -101,3 +101,40 @@ Logs: `logs/` (gitignored). All paths env-overridable via `KILIMALL_ROOT`.
   pattern; create `kilimall-marketplace-archive-github-token`.
 - Never run from shared IPs at volume; daily delta only.
 - FX pass-through: prices in KES; no FX table included yet.
+
+## Common Crawl campaign (2026-11-16 — the "how Jiji did millions in <1 month" play)
+
+Phase 1 — index (running NOW): `.github/workflows/cc-mine.yml` — 32 CC-MAIN
+crawl legs (2024→2026), `max-parallel: 20`, each leg paginates
+`index.commoncrawl.org` CDXJ for prefix `kilimall.co.ke/listing/*` + `status:200`,
+keeps records to `cc_index/kilimall.co.ke.jsonl` and uploads a gzipped shard
+(`cc-index-<crawl>.jsonl.gz`) to the rolling `cc-index` release. Zero requests
+to kilimall.co.ke. Re-polls every 3h; legs no-op once their asset exists.
+Local resumable collector: `scripts/cc_index_collect.py` (markers in cc_index/.done/).
+
+Phase 2 — manifest + shards (offline):
+```bash
+for f in `gh release download cc-index --pattern '*.jsonl.gz' -O /tmp/`; do :; done
+gh release download cc-index --repo ssmurfgg04-gif/kilimall-marketplace-archive --pattern '*.jsonl.gz' --dir cc_index/
+for f in cc_index/*.jsonl.gz; do gunzip -k "$f"; done
+python scripts/cc_layer0.py --min-year 2024   # -> cc_manifest/manifest.parquet
+python scripts/cc_partition.py               # -> data/warc_shards/kilimall_shard_00..19.tsv
+git add data/warc_shards && git commit -m 'shards: kilimall CC capture ranges' && git push
+```
+
+Phase 3 — body drain (hosted legs): `.github/workflows/cc-drain.yml` (manual,
+`shards=all`) — 20 legs × 4 workers, byte-range GETs to `data.commoncrawl.org`
+(CC CDN), JSON-LD parsed inline (same extractor as live collector), part DBs
+uploaded as artifacts (`if: always()` — dead legs bank progress).
+
+Phase 4 — merge (local):
+```bash
+for i in $(seq 0 19); do gh run download RUN_ID --name "warc-part-$i" --dir /tmp/warc-parts; done
+python scripts/warc_merge.py --part-dir /tmp/warc-parts
+```
+→ `warc_item` table (capture_ts = original CC crawl time = true historical
+prices) + `price_history` rows tagged `source='commoncrawl'`.
+
+Provenance note: capture_ts is the ARCHIVE time, not our fetch time — every
+historical row is attributable to its crawl. Zero kilimall.co.ke requests
+across ALL phases.
