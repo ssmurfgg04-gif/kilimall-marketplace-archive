@@ -1,0 +1,100 @@
+name: Live Kilimall delta (hosted runners)
+
+# Kilimall's storefront allows off-peak, rate-limited access (robots.txt allows the
+# sitemap + /listing/*, disallows /api/*) — unlike Jiji, GitHub-hosted runners are fine.
+# robots-compliant always: one worker, 3–8s delays, <=60 pages per run, never /api/*.
+#
+# Flash sales: do NOT add sub-5-minute schedules (cron granularity + politeness).
+# Use "Run workflow" (workflow_dispatch) instead — the delta only pulls changed/unseen
+# listings, so a one-shot refresh right after a sale starts is exact and cheap.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_items:
+        description: 'Max listings to collect this run (polite cap)'
+        required: false
+        default: '60'
+  schedule:
+    # 08:00, 11:00, 14:00, 17:00, 20:00, 23:00 EAT (Africa/Nairobi, UTC+3)
+    - cron: "0 5,8,11,14,17,20 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kilimall-live
+  cancel-in-progress: false
+
+jobs:
+  collect-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install blake3 duckdb
+
+      - name: Restore sitemap index + DB cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: kilimall-data-v1-${{ github.run_id }}
+          restore-keys: kilimall-data-v1-
+
+      - name: Seed DB from rolling release (first run only)
+        run: |
+          mkdir -p data
+          if [ ! -f data/kilimall.db ]; then
+            if curl -fsSL -o data/kilimall.db.zip "https://github.com/${{ github.repository }}/releases/download/live-latest/kilimall.db.zip"; then
+              python -c "import zipfile; zipfile.ZipFile('data/kilimall.db.zip').extractall('data')" && rm data/kilimall.db.zip
+              echo "seeded from rolling release"
+            else
+              echo "no prior DB — starting fresh (fills up over delta runs)"
+            fi
+          fi
+
+      - name: Refresh sitemap index if missing
+        run: |
+          mkdir -p data
+          if [ ! -f data/url_index.tsv ]; then python scripts/kilimall_sitemap.py; fi
+
+      - name: Collect delta (changed/unseen only)
+        env:
+          MAX_ITEMS: ${{ inputs.max_items || '60' }}
+        run: python scripts/kilimall_incremental.py --mode delta --max-items "$MAX_ITEMS"
+
+      - name: Mark dead listings (14d stale)
+        run: python scripts/data_quality.py --days 14 || true
+
+      - name: Package and publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          mkdir -p data/cold
+          python - <<'PY'
+          import os, sqlite3
+          live, cold = 'data/kilimall.db', 'data/cold/kilimall.db'
+          s = sqlite3.connect(live); d = sqlite3.connect(cold)
+          s.backup(d); d.execute("PRAGMA wal_checkpoint(TRUNCATE)"); d.close(); s.close()
+          PY
+          (cd data/cold && python -c "import zipfile; zipfile.ZipFile('../kilimall.db.zip','w',zipfile.ZIP_DEFLATED).write('kilimall.db')")
+          snap="data/snapshot-$(date +%F).parquet"
+          if [ -f "$snap" ]; then cp "$snap" data/kilimall-live-latest.parquet; fi
+          (cd data && sha256sum kilimall.db.zip kilimall-live-latest.parquet | sed 's/ .*\///' > SHA256SUMS)
+          if gh release view live-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then :; else
+            gh release create live-latest --repo "$GITHUB_REPOSITORY" --title 'Live dataset (rolling)' --prerelease \
+              --notes 'Rolling live delta collected on GitHub-hosted runners (robots-compliant: sitemap + /listing JSON-LD only).'
+          fi
+          gh release upload live-latest data/kilimall.db.zip data/kilimall-live-latest.parquet data/SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Save data cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: kilimall-data-v1-${{ github.run_id }}
