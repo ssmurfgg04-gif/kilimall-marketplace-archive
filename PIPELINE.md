@@ -138,3 +138,15 @@ prices) + `price_history` rows tagged `source='commoncrawl'`.
 Provenance note: capture_ts is the ARCHIVE time, not our fetch time — every
 historical row is attributable to its crawl. Zero kilimall.co.ke requests
 across ALL phases.
+
+## Autonomy posture (user away 2026-11-16 → ~11-18)
+
+- cc-drain legs exit 0 regardless of per-item outcome; artifacts upload with
+  if: always(). If a leg dies, re-dispatch a single shard (`shards=3`) — the
+  merge job accepts whatever artifacts exist.
+- live-delta: 6×/day EAT, ≤15 items/run — fits hosted-runner Azure↔Kenya latency.
+- live-latest release is the single restore source; every published DB must be
+  ≥1 row (integrity guard) before clobber.
+- Monthly: day-01 robots check + immutable vYYYY-MM-DD rollup (in live-delta).
+- Tokens: GitHub PAT stored in KeePass (`jiji-marketplace-archive-github-token`)
+  — rotate when convenient; transcript exposure acknowledged.

@@ -11,14 +11,28 @@ An auditable, provenance-first snapshot of public Kilimall (kilimall.co.ke) prod
 
 `robots.txt` **disallows `/api/*`** — this pipeline never calls the API. Listing pages and the sitemap are allowed. One worker, random 3–8s delays, in-flight cap (`--max-items`, default 60). Do not run collectors aggressively.
 
+## Current inventory (2026-11-16)
+
+- Live `listings`: accumulates from polite deltas (see Release `live-latest`).
+- `warc_item`: Common Crawl captures of /listing/* pages (2024→2026) —
+  ~20,343 captures at first harvest; byte-range fetched from CC's CDN,
+  zero requests to kilimall.co.ke. Capture timestamps = original crawl times.
+- `price_history`: every observation; `source='commoncrawl'` for CC-mined rows.
+- `listing_risk`: views-free price/availability heuristic (experimental).
+
 ## Quick start (query a release asset)
 
 ```sql
-SELECT title, price, availability, last_seen
-FROM listings
-ORDER BY last_seen DESC
+SELECT title, price, availability, capture_ts
+FROM warc_item
+ORDER BY capture_ts DESC
 LIMIT 20;
+
+SELECT count(*), min(capture_ts), max(capture_ts) FROM warc_item;
 ```
+
+CC-mined SKUs join to listings by listing ID (the numeric part of
+`/listing/<id>-...`).
 
 ## Repository layout
 
