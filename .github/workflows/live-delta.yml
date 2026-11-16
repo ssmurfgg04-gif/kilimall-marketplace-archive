@@ -15,7 +15,7 @@ on:
       max_items:
         description: 'Max listings to collect this run (polite cap)'
         required: false
-        default: '40'
+        default: '15'
   schedule:
     # 08:00, 11:00, 14:00, 17:00, 20:00, 23:00 EAT (Africa/Nairobi, UTC+3)
     - cron: "0 5,8,11,14,17,20 * * *"
@@ -30,7 +30,7 @@ concurrency:
 jobs:
   collect-and-publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -53,11 +53,14 @@ def main():
                 })
                 n += 1
         print(f"{path.name}: {n} captures")
+    tmp = OUT / "manifest.jsonl"
+    with tmp.open("w", encoding="utf-8") as f:
+        for r in rows:
+            import json as _json
+            f.write(_json.dumps(r, separators=(",", ":")) + "\n")
     con = duckdb.connect()
-    con.register("rows", rows)
-    con.sql("create table manifest as select * from rows")
     out = OUT / "manifest.parquet"
-    con.sql(f"copy manifest to '{out}' (format parquet)")
+    con.sql(f"copy (select * from read_ndjson_auto('{tmp}')) to '{out}' (format parquet)")
     print(f"manifest: {len(rows)} captures -> {out}")
 
 

@@ -18,7 +18,8 @@ N = 20
 
 
 def main():
-    rows = duckdb.sql(f"select warc_filename, offset, length, url, capture_ts, mime from '{BASE}/cc_manifest/manifest.parquet'").fetchall()
+    sql = f"select warc_filename, \"offset\", \"length\", url, capture_ts, mime from read_parquet('{BASE}/cc_manifest/manifest.parquet')"
+    rows = duckdb.sql(sql).fetchall()
     handles = [open(OUT / f"kilimall_shard_{i:02d}.tsv", "w", encoding="utf-8") for i in range(N)]
     seen = set()
     kept = junk = dup = 0
