@@ -1,0 +1,58 @@
+name: CC index mine (hosted legs, re-polls until done)
+
+# Parallel hosted-runner harvesting of the Common Crawl index for kilimall.co.ke
+# /listing/* captures. Public repo = free Actions minutes.
+# Source: index.commoncrawl.org CDXJ, prefix kilimall.co.ke/listing/* + filter=status:200.
+# Zero requests are sent to kilimall.co.ke in this workflow.
+#
+# Re-poll semantics: a leg checks whether release 'cc-index' already carries
+# asset cc-index-<crawl>.jsonl.gz and no-ops if so. Cron re-triggers every 3h;
+# once every crawl has an asset, all legs no-op.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 */3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cc-mine
+  cancel-in-progress: false
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        crawl: ['CC-MAIN-2026-43', 'CC-MAIN-2026-39', 'CC-MAIN-2026-34', 'CC-MAIN-2026-30', 'CC-MAIN-2026-25', 'CC-MAIN-2026-21', 'CC-MAIN-2026-17', 'CC-MAIN-2026-12', 'CC-MAIN-2026-08', 'CC-MAIN-2026-04', 'CC-MAIN-2025-51', 'CC-MAIN-2025-47', 'CC-MAIN-2025-43', 'CC-MAIN-2025-38', 'CC-MAIN-2025-33', 'CC-MAIN-2025-30', 'CC-MAIN-2025-26', 'CC-MAIN-2025-21', 'CC-MAIN-2025-18', 'CC-MAIN-2025-13', 'CC-MAIN-2025-08', 'CC-MAIN-2025-05', 'CC-MAIN-2024-51', 'CC-MAIN-2024-46', 'CC-MAIN-2024-42', 'CC-MAIN-2024-38', 'CC-MAIN-2024-33', 'CC-MAIN-2024-30', 'CC-MAIN-2024-26', 'CC-MAIN-2024-22', 'CC-MAIN-2024-18', 'CC-MAIN-2024-10']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests
+      - name: Skip leg if already harvested
+        id: have
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view cc-index --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null | grep -qx "cc-index-${{ matrix.crawl }}.jsonl.gz"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "crawl already harvested — leg no-ops"
+          fi
+      - name: Collect crawl (paginated CDXJ, prefix /listing/)
+        if: steps.have.outputs.skip != 'true'
+        run: python scripts/cc_index_collect.py --crawl "${{ matrix.crawl }}"
+      - name: Upload crawl shard to rolling release
+        if: steps.have.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gzip -9 -c cc_index/kilimall.co.ke.jsonl > "cc-index-${{ matrix.crawl }}.jsonl.gz"
+          ls -la "cc-index-${{ matrix.crawl }}.jsonl.gz"
+          gh release upload cc-index "cc-index-${{ matrix.crawl }}.jsonl.gz" --repo "$GITHUB_REPOSITORY"
