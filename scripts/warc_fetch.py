@@ -72,6 +72,7 @@ LOCK = threading.Lock()
 
 
 def fetch_range(fn, off, ln, sess):
+    off, ln = int(off), int(ln)
     try:
         r = sess.get(CC + fn, headers={"Range": f"bytes={off}-{off + ln - 1}"},
                      timeout=60, stream=False)
