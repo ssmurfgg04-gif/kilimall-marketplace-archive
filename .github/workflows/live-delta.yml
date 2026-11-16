@@ -6,7 +6,8 @@ name: Live Kilimall delta (hosted runners)
 #
 # Flash sales: do NOT add sub-5-minute schedules (cron granularity + politeness).
 # Use "Run workflow" (workflow_dispatch) instead — the delta only pulls changed/unseen
-# listings, so a one-shot refresh right after a sale starts is exact and cheap.
+# listings (plus the stalest-known ones get re-checked), so a one-shot refresh right
+# after a sale starts is exact and cheap.
 
 on:
   workflow_dispatch:
@@ -35,7 +36,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: pip
       - run: pip install blake3 duckdb
 
       - name: Restore sitemap index + DB cache
@@ -53,28 +53,69 @@ jobs:
               python -c "import zipfile; zipfile.ZipFile('data/kilimall.db.zip').extractall('data')" && rm data/kilimall.db.zip
               echo "seeded from rolling release"
             else
-              echo "no prior DB — starting fresh (fills up over delta runs)"
+              echo "::warning::No rolling-release DB found — this run bootstraps an empty archive (expected only on first ever run)"
             fi
           fi
 
-      - name: Refresh sitemap index if missing
+      - name: Refresh sitemap index if missing (first run only)
         run: |
           mkdir -p data
           if [ ! -f data/url_index.tsv ]; then python scripts/kilimall_sitemap.py; fi
 
-      - name: Collect delta (changed/unseen only)
+      - name: Weekly sitemap refresh (Mondays)
+        # lastmod drifts daily; skip-downloads cached shards, re-parses only.
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "$(date -u +%u)" = "1" ]; then
+            echo "Monday slot: re-syncing sitemap index (skip cached shards)"
+            python scripts/kilimall_sitemap.py
+          else
+            echo "not Monday — sitemap refresh skipped"
+          fi
+
+      - name: Collect delta (changed/unseen + stalest known)
         env:
           MAX_ITEMS: ${{ inputs.max_items || '60' }}
-        run: python scripts/kilimall_incremental.py --mode delta --max-items "$MAX_ITEMS"
+        run: python scripts/kilimall_incremental.py --mode delta --max-items "$MAX_ITEMS" --refresh-oldest 15
 
       - name: Mark dead listings (14d stale)
         run: python scripts/data_quality.py --days 14 || true
+
+      - name: Views-free risk heuristic
+        run: python scripts/listing_risk.py || true
+
+      - name: Run summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import os, sqlite3
+          path = os.environ.get('GITHUB_STEP_SUMMARY', '/tmp/summary.md')
+          if not os.path.exists('data/kilimall.db'):
+              open(path, 'a').write('## Live delta\n\nDB missing\n')
+              raise SystemExit(0)
+          c = sqlite3.connect('data/kilimall.db')
+          n = c.execute('select count(*) from listings').fetchone()[0]
+          pr = c.execute('select count(price) from listings where price is not null').fetchone()[0]
+          gone = c.execute('select count(*) from listings where died_at is not null').fetchone()[0]
+          run = c.execute('select new, changed from runs order by id desc limit 1').fetchone()
+          with open(path, 'a') as f:
+              f.write('## Live delta\n\n')
+              f.write(f'- listings: {n} (priced: {pr}, marked died: {gone})\n')
+              f.write(f'- last run new/changed: {run[0]}/{run[1]}\n')
+          PY
+
+      - name: Robots policy check (1st of month)
+        run: |
+          if [ "$(date -u +%d)" = "01" ]; then python scripts/robots_check.py; else echo "not 1st — skipped"; fi
 
       - name: Package and publish rolling release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
+          [ -s data/kilimall.db ] || { echo "[guard] DB missing — refusing to publish an empty snapshot"; exit 1; }
+          rows=$(python -c "import sqlite3; print(sqlite3.connect('data/kilimall.db').execute('select count(*) from listings').fetchone()[0])")
+          [ "$rows" -ge 1 ] || { echo "[guard] DB has 0 rows — refusing to publish"; exit 1; }
           mkdir -p data/cold
           python - <<'PY'
           import os, sqlite3
@@ -91,6 +132,20 @@ jobs:
               --notes 'Rolling live delta collected on GitHub-hosted runners (robots-compliant: sitemap + /listing JSON-LD only).'
           fi
           gh release upload live-latest data/kilimall.db.zip data/kilimall-live-latest.parquet data/SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Monthly immutable rollup (1st of month)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(date -u +%d)" = "01" ]; then
+            tag="v$(date -u +%Y-%m-%d)"
+            echo "creating immutable rollup $tag"
+            gh release create "$tag" data/kilimall.db.zip data/kilimall-live-latest.parquet data/SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" --title "Frozen rollup $tag" \
+              --notes "Immutable monthly rollup of the rolling live dataset."
+          else
+            echo "not 1st — rollup skipped"
+          fi
 
       - name: Save data cache
         if: always()

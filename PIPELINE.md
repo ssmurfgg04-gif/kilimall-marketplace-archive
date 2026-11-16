@@ -45,19 +45,37 @@ Fresh build. `url_index.tsv` catalogued from the product/category/store
 sitemap shards (lastmod 2026-11-14). Live rows accumulate from first run
 (2026-11-16). Historical backfill is explicitly **not** done — see future layers.
 
-## Linux local runner (systemd user timer)
+## GitHub-hosted runner path (canonical live path, 2026-11-16)
 
-No GitHub-hosted workflow touches kilimall.co.ke (shared runner IPs are a
-bot-wall risk; see jiji ledger L-031). Instead:
+robots.txt allows the sitemap + `/listing/*` (disallows `/api/*` — never used),
+and Kilimall does not bot-wall hosted runner IPs, so `.github/workflows/live-delta.yml`
+runs the polite delta 6×/day EAT (08/11/14/17/20/23 EAT) and on `workflow_dispatch`
+(flash-sale refresh; ~2–4 min):
 
-- `~/.local/bin/kilimall-live-daily.sh` — daily 09:45 EAT
-  (`kilimall-live-daily.timer`): pulls repo, refreshes `url_index.tsv` if older
-  than 7 days, runs `--mode delta`, data-quality weekly slot, packages and (if
-  `KILLIMALL_RELEASE_TOKEN` or `JIJI_RELEASE_TOKEN` resolvable) publishes the
-  rolling `live-latest` release.
-- `~/.local/bin/kilimall-fraud-watch` equivalent: not yet ported — Kilimall
-  pages do not expose views; risk heuristics need redesign (see TODO).
+- Restores sitemap index + DB cache (actions/cache, prefix `kilimall-data-v1-`);
+  seeds `data/kilimall.db` from the rolling `live-latest` release if absent.
+- Monday: `kilimall_sitemap.py --refresh` (skip-downloads cached shards).
+- Collects changed/unseen items (`--mode delta`, `--max-items 60`) **plus the
+  15 stalest known listings** (`--refresh-oldest 15`) — without that, old prices
+  would freeze forever (sitemap lastmod < our capture date ⇒ skipped forever).
+- Views-free risk heuristic (`scripts/listing_risk.py`): price vs trailing
+  SKU median, availability flip count, discount persistence → `listing_risk`
+  table. Experimental, NOT a fraud verdict.
+- Integrity guards: refuses to publish an empty/missing DB; every run writes a
+  `GITHUB_STEP_SUMMARY` (listings/priced/died/newest run new+changed).
+- 1st of month: `scripts/robots_check.py` (asserts OUR policy: /api still
+  disallowed, sitemap + /listing usable) **and** an immutable rollup release
+  `vYYYY-MM-DD` (assets clobbered only on the rolling tag, never on rollups).
+- `.github/workflows/backfill.yml` — manual deep sweep, `--offset` pages the
+  344k-url index; `offset=250, 500, …` per dispatch. 250/night ≈ 3.8 years for
+  full coverage — delta is the right tool for tracking; this is for rescue.
 
+A local residential timer was considered but NOT kept — single writer rule.
+
+## Legacy Linux local runner (disabled, kept for reference)
+
+`~/.local/bin/kilimall-live-daily.sh` + `kilimall-live-daily.timer` (local)
+predates the hosted-runner path and was never enabled. Kept as documented history.
 Logs: `logs/` (gitignored). All paths env-overridable via `KILIMALL_ROOT`.
 
 ## Future layers
@@ -67,6 +85,14 @@ Logs: `logs/` (gitignored). All paths env-overridable via `KILIMALL_ROOT`.
 | Historical delta | Common Crawl index for `kilimall.co.ke` (CDX API on GH Actions; data from allowed network) | mirror of jiji Layer 0; requires `cc_index` collector port |
 | Deal hunting | price < k × trailing category average | needs category derivation from breadcrumb metadata (not in JSON-LD) |
 | Risk/views | seller/store metadata from `store-01` sitemap + listing pages | views not exposed server-side; proxies only |
+
+## Provenance notes (2026-11-16)
+
+- Seeded 2026-11-16: 40 newest listings (all priced KES, all InStock in sample).
+- First GH-hosted delta run id 43817963960 (after requirements.txt pip-cache fix).
+- Coverage = sitemap index (344,841 URLs, lastmod 2026-11-14) + delta accumulation.
+  Historical (pre-2026-11-16) prices NOT included; requires Common Crawl mining.
+- Every price carries first_seen/last_seen; every observation lands in price_history.
 
 ## Ops
 

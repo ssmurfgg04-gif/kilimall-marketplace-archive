@@ -1,0 +1,94 @@
+name: Deep backfill sweep (manual)
+
+# Opt-in ONLY: workflow_dispatch. Not scheduled.
+# Polite deep sweep: --offset pages you through the 344k-url index; each dispatch
+# advances coverage (e.g. offset=250, 500, ...). 250/night ≈ 3.8 YEARS for full
+# coverage — the delta path is the right tool for tracking; this is for recovery.
+
+on:
+  workflow_dispatch:
+    inputs:
+      offset:
+        description: 'Skip first N index entries (page this sweep forward)'
+        required: true
+        default: '0'
+      max_items:
+        description: 'Items this sweep (polite cap)'
+        required: false
+        default: '250'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kilimall-live
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install blake3 duckdb
+
+      - name: Restore sitemap index + DB cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: kilimall-data-v1-${{ github.run_id }}
+          restore-keys: kilimall-data-v1-
+
+      - name: Seed DB from rolling release
+        run: |
+          mkdir -p data
+          if [ ! -f data/kilimall.db ]; then
+            if curl -fsSL -o data/kilimall.db.zip "https://github.com/${{ github.repository }}/releases/download/live-latest/kilimall.db.zip"; then
+              python -c "import zipfile; zipfile.ZipFile('data/kilimall.db.zip').extractall('data')" && rm data/kilimall.db.zip
+            else
+              echo "no prior DB — backfill fills from the index directly"
+            fi
+          fi
+          [ -f data/url_index.tsv ] || python scripts/kilimall_sitemap.py
+
+      - name: Backfill sweep
+        env:
+          OFFSET: ${{ inputs.offset }}
+          MAX_ITEMS: ${{ inputs.max_items || '250' }}
+        run: python scripts/kilimall_incremental.py --mode all --offset "$OFFSET" --max-items "$MAX_ITEMS"
+
+      - name: Mark dead listings (14d stale)
+        run: python scripts/data_quality.py --days 14 || true
+
+      - name: Package and publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          [ -s data/kilimall.db ] || { echo "[guard] DB missing — refusing to publish empty snapshot"; exit 1; }
+          mkdir -p data/cold
+          python - <<'PY'
+          import os, sqlite3
+          live, cold = 'data/kilimall.db', 'data/cold/kilimall.db'
+          s = sqlite3.connect(live); d = sqlite3.connect(cold)
+          s.backup(d); d.execute("PRAGMA wal_checkpoint(TRUNCATE)"); d.close(); s.close()
+          PY
+          (cd data/cold && python -c "import zipfile; zipfile.ZipFile('../kilimall.db.zip','w',zipfile.ZIP_DEFLATED).write('kilimall.db')")
+          snap="data/snapshot-$(date +%F).parquet"
+          if [ -f "$snap" ]; then cp "$snap" data/kilimall-live-latest.parquet; fi
+          (cd data && sha256sum kilimall.db.zip kilimall-live-latest.parquet | sed 's/ .*\///' > SHA256SUMS)
+          if gh release view live-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then :; else
+            gh release create live-latest --repo "$GITHUB_REPOSITORY" --title 'Live dataset (rolling)' --prerelease \
+              --notes 'Rolling live delta collected on GitHub-hosted runners.'
+          fi
+          gh release upload live-latest data/kilimall.db.zip data/kilimall-live-latest.parquet data/SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Save data cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: kilimall-data-v1-${{ github.run_id }}

@@ -85,6 +85,20 @@ def parse_product(html):
                     candidates.append(obj[k])
         for c in candidates:
             if isinstance(c, dict) and c.get("@type") == "Product":
+                bc = None
+                if isinstance(obj, dict) and isinstance(obj.get("breadcrumb"), dict):
+                    items_bc = obj["breadcrumb"].get("itemListElement") or []
+                    names = []
+                    for it in items_bc:
+                        inner = it.get("item", it) if isinstance(it, dict) else {}
+                        name = (inner.get("name") if isinstance(inner, dict) else None) or it.get("name")
+                        if name and name.lower() != "home":
+                            names.append(name)
+                    if names:
+                        bc = " > ".join(names)
+                c = dict(c)
+                if bc:
+                    c["__breadcrumb__"] = bc
                 return c
     return None
 
@@ -111,6 +125,7 @@ def record(o: dict):
         "availability": offers.get("availability") or "",
         "item_condition": offers.get("itemCondition") or "",
         "description": (o.get("description") or "").strip()[:2000],
+        "category": (o.get("__breadcrumb__") or "").strip()[:300],
     }
 
 
@@ -126,6 +141,10 @@ def main():
     ap.add_argument("--skus-file", help="optional file of SKUs/URLs to collect explicitly")
     ap.add_argument("--mode", choices=["delta", "all"], default="delta")
     ap.add_argument("--max-items", type=int, default=60)
+    ap.add_argument("--refresh-oldest", type=int, default=15,
+                    help="additionally re-collect N stalest-seen listings so their prices refresh")
+    ap.add_argument("--offset", type=int, default=0,
+                    help="skip first N index candidates (deep backfill paging)")
     ap.add_argument("--dmin", type=float, default=3.0)
     ap.add_argument("--dmax", type=float, default=8.0)
     ap.add_argument("--snapshot", action="store_true", default=True)
@@ -134,6 +153,9 @@ def main():
     Path(args.db).parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(args.db, timeout=120)
     db.executescript(DDL)
+    cols = [c[1] for c in db.execute("PRAGMA table_info(listings)").fetchall()]
+    if "category" not in cols:
+        db.execute("ALTER TABLE listings ADD COLUMN category TEXT")
     started = now()
 
     db_max = db.execute("select max(last_seen) from listings").fetchone()[0] or ""
@@ -148,22 +170,46 @@ def main():
         rows = db.execute("select guid from listings").fetchall()
         seen = {g for (g,) in rows}
         items = []
+        skipped = 0
         with open(args.index, encoding="utf-8") as f:
             next(f)
             for line in f:
                 sku, url, lastmod, _shard = line.rstrip("\n").split("\t")
                 if not sku:
                     continue
+                if skipped < args.offset:
+                    skipped += 1
+                    continue
                 if sku in seen and lastmod <= db_max:
                     continue
                 items.append((sku, url, lastmod))
                 if len(items) >= args.max_items:
                     break
-    else:
+        # improvement: always give the stalest known listings a refresh,
+        # otherwise their prices silently freeze forever.
+        if args.refresh_oldest:
+            already = {i[0] for i in items}
+            oldest = db.execute(
+                "select guid, url from listings order by last_seen asc limit ?",
+                (args.refresh_oldest,)).fetchall()
+            for g, u in oldest:
+                if g not in already:
+                    items.append((g, u, ""))
+    else:  # all / backfill sweep (page with --offset)
+        items = []
+        skipped = 0
         with open(args.index, encoding="utf-8") as f:
             next(f)
-            items = [tuple(l.rstrip("\n").split("\t")[:3]) for l in f if l.strip()]
-        items = items[: args.max_items]
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if not parts[0]:
+                    continue
+                if skipped < args.offset:
+                    skipped += 1
+                    continue
+                items.append(tuple(parts[:3]))
+                if len(items) >= args.max_items:
+                    break
 
     print(f"collecting {len(items)} listings (mode={args.mode})")
     new = changed = gone = 0
@@ -194,16 +240,16 @@ def main():
         prev = db.execute("select last_hash from listings where guid=?", (r_["guid"],)).fetchone()
         if prev is None:
             db.execute(
-                "insert into listings(guid,title,price,currency,url,brand,availability,item_condition,first_seen,last_seen,last_hash,description,source)"
-                " values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "insert into listings(guid,title,price,currency,url,brand,availability,item_condition,category,first_seen,last_seen,last_hash,description,source)"
+                " values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (r_["guid"], r_["title"], r_["price"], r_["currency"], r_["url"] or url, r_["brand"], r_["availability"],
-                 r_["item_condition"], t, t, h, r_["description"], "live"))
+                 r_["item_condition"], r_["category"], t, t, h, r_["description"], "live"))
             new += 1
         else:
             db.execute("update listings set last_seen=?, last_hash=?, died_at=NULL,"
-                       " title=?, price=?, availability=?, url=?, description=?"
+                       " title=?, price=?, availability=?, url=?, description=?, category=?"
                        " where guid=?",
-                       (t, h, r_["title"], r_["price"], r_["availability"], r_["url"] or url, r_["description"], r_["guid"]))
+                       (t, h, r_["title"], r_["price"], r_["availability"], r_["url"] or url, r_["description"], r_["category"], r_["guid"]))
             if prev[0] != h:
                 changed += 1
         db.execute("insert into price_history(guid,seen_at,price,hash,source) values(?,?,?,?,?)",
