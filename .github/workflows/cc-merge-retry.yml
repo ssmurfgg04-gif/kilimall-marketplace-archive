@@ -1,11 +1,18 @@
 name: CC merge watchdog (auto-finish a drain)
 
-# Closes the loop when a `CC body drain` run completes (artifacts persist 7 days):
-# download part DBs -> merge into the main DB -> backfill categories -> re-publish
-# enriched live-latest. Idempotent: a git tag `cc-merge-done-<runId>` marks success.
+# Safety net for `CC body drain`: if its own merge job failed or was skipped,
+# this finds the newest finished drain run (success OR failure — a run with a
+# few failed legs still has good artifacts; cancelled runs are ignored) that has
+# no `cc-merge-done-<runId>` tag, and merges/publishes it with the same script.
+# Artifacts persist 7 days.
 
 on:
   workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Drain run to merge (blank = newest unmerged)"
+        required: false
+        default: ""
   schedule:
     - cron: "*/30 * * * *"
 
@@ -14,104 +21,45 @@ permissions:
   actions: read
 
 concurrency:
-  group: cc-merge-watchdog
+  group: kilimall-live
   cancel-in-progress: false
 
 jobs:
   merge:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: pip install requests duckdb blake3
 
-      - name: Find latest completed drain run without a done-tag
+      - name: Find drain run to merge
         id: target
         env:
           GH_TOKEN: ${{ github.token }}
+          WANT: ${{ inputs.run_id }}
         run: |
           set -e
-          # newest drain run that actually SUCCEEDED (cancelled/failed runs have no usable artifacts)
-          rid=$(gh run list --workflow cc-drain.yml --repo "$GITHUB_REPOSITORY" --limit 10 \
-                --json databaseId,status,conclusion --jq '[.[] | select(.status == "completed" and .conclusion == "success")] | .[0].databaseId // ""')
-          if [ -z "$rid" ]; then echo "no completed drain run yet — nothing to do"; echo "run_id=" >> "$GITHUB_OUTPUT"; exit 0; fi
-          if git ls-remote --tags origin | grep -q "cc-merge-done-$rid\$"; then
-            echo "run $rid already merged — nothing to do"; echo "run_id=" >> "$GITHUB_OUTPUT"; exit 0
+          tags=$(git ls-remote --tags origin 'cc-merge-done-*' | sed -E 's#.*/cc-merge-done-([0-9]+).*#\1#' | sort -u)
+          if [ -n "$WANT" ]; then rid="$WANT"; else
+            rid=""
+            for id in $(gh run list --workflow cc-drain.yml --repo "$GITHUB_REPOSITORY" --limit 10 \
+                  --json databaseId,status,conclusion \
+                  --jq '.[] | select(.status == "completed" and (.conclusion == "success" or .conclusion == "failure")) | .databaseId'); do
+              if ! grep -qx "$id" <<<"$tags"; then rid="$id"; break; fi
+              break   # newest finished run already merged -> nothing to do
+            done
           fi
-          echo "target drain run: $rid"
+          [ -n "$rid" ] && echo "target drain run: $rid" || echo "nothing to merge"
           echo "run_id=$rid" >> "$GITHUB_OUTPUT"
 
-      - name: Download part DBs from the drain run
+      - uses: actions/setup-python@v5
+        if: steps.target.outputs.run_id != ''
+        with:
+          python-version: '3.12'
+      - if: steps.target.outputs.run_id != ''
+        run: pip install requests duckdb blake3
+
+      - name: Merge all parts, publish, tag
         if: steps.target.outputs.run_id != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p /tmp/warc-parts
-          gh run download "${{ steps.target.outputs.run_id }}" --repo "$GITHUB_REPOSITORY" \
-            --pattern "warc-part-*" --dir /tmp/warc-parts
-          n=$(find /tmp/warc-parts -name '*.db' | wc -l)
-          echo "downloaded $n part DBs"
-          [ "$n" -ge 1 ] || { echo "no part DBs — aborting"; exit 1; }
-          total=$(python - <<'PY2'
-          import glob, sqlite3, sys
-          t = 0
-          for f in glob.glob('/tmp/warc-parts/**/*.db', recursive=True):
-              try:
-                  t += sqlite3.connect(f).execute('select count(*) from warc_item').fetchone()[0]
-              except Exception as e:
-                  print('bad part db', f, e, file=sys.stderr)
-          print(t)
-          PY2
-          )
-          echo "total warc_item rows across part DBs: $total"
-          if [ "$total" -ge 1 ]; then echo "has_data=true" >> "$GITHUB_ENV"; else echo "has_data=false" >> "$GITHUB_ENV"; echo "0 rows fetched across ALL part DBs — refusing to tag done; will retry after a re-dispatch"; fi
-
-      - name: Seed DB from rolling release
-        if: steps.target.outputs.run_id != '' && env.has_data == 'true'
-        run: |
-          mkdir -p data
-          if curl -fsSL -o data/kilimall.db.zip "https://github.com/${{ github.repository }}/releases/download/live-latest/kilimall.db.zip"; then
-            python -c "import zipfile; zipfile.ZipFile('data/kilimall.db.zip').extractall('data')" && rm data/kilimall.db.zip
-            echo "seeded from rolling release"
-          else
-            echo "no prior DB — merge creates schema"
-          fi
-
-      - name: Merge parts and backfill categories
-        if: steps.target.outputs.run_id != '' && env.has_data == 'true'
-        run: |
-          python scripts/warc_merge.py --part-dir /tmp/warc-parts
-          python scripts/backfill_categories.py
-
-      - name: Publish enriched live-latest release
-        if: steps.target.outputs.run_id != '' && env.has_data == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -e
-          [ -s data/kilimall.db ] || { echo "[guard] DB missing"; exit 1; }
-          n=$(python -c "import sqlite3; print(sqlite3.connect('data/kilimall.db').execute('select count(*) from warc_item').fetchone()[0])")
-          echo "warc_item rows after merge: $n"
-          mkdir -p data/cold
-          python - <<'PY'
-          import os, sqlite3
-          live, cold = 'data/kilimall.db', 'data/cold/kilimall.db'
-          s = sqlite3.connect(live); d = sqlite3.connect(cold)
-          s.backup(d); d.execute("PRAGMA wal_checkpoint(TRUNCATE)"); d.close(); s.close()
-          PY
-          [ "$n" -ge 1 ] || { echo "[guard] merge produced 0 warc_item rows — not publishing"; exit 1; }
-          (cd data/cold && python -c "import zipfile; zipfile.ZipFile('../kilimall.db.zip','w',zipfile.ZIP_DEFLATED).write('kilimall.db')")
-          python -c "import duckdb; duckdb.sql(\"install sqlite; load sqlite; copy (select * from sqlite_scan('data/kilimall.db','listings')) to 'data/kilimall-live-latest.parquet' (format parquet)\")"
-          (cd data && sha256sum kilimall.db.zip kilimall-live-latest.parquet > SHA256SUMS)
-          gh release upload live-latest data/kilimall.db.zip data/kilimall-live-latest.parquet data/SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
-
-      - name: Tag merge done
-        if: steps.target.outputs.run_id != '' && env.has_data == 'true'
-        run: |
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config user.name "github-actions[bot]"
-          git tag -a "cc-merge-done-${{ steps.target.outputs.run_id }}" -m "Merged CC harvest: auto-finish for drain run ${{ steps.target.outputs.run_id }}"
-          git push origin "cc-merge-done-${{ steps.target.outputs.run_id }}"
+        run: bash scripts/ci_merge_run.sh "${{ steps.target.outputs.run_id }}"

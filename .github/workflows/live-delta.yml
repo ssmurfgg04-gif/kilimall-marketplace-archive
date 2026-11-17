@@ -45,18 +45,10 @@ jobs:
           key: kilimall-data-v1-${{ github.run_id }}
           restore-keys: kilimall-data-v1-
 
-      - name: Seed DB from rolling release (first run only)
-        run: |
-          mkdir -p data
-          if [ ! -f data/kilimall.db ]; then
-            if curl -fsSL -o data/kilimall.db.zip "https://github.com/${{ github.repository }}/releases/download/live-latest/kilimall.db.zip"; then
-              python -c "import zipfile; zipfile.ZipFile('data/kilimall.db.zip').extractall('data')" && rm data/kilimall.db.zip
-              echo "seeded from rolling release"
-            else
-              echo "::warning::No rolling-release DB found — this run bootstraps an empty archive (expected only on first ever run)"
-            fi
-          fi
-
+      - name: Seed DB from rolling release (always — release is the source of truth)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci_seed.sh
       - name: Refresh sitemap index if missing (first run only)
         run: |
           mkdir -p data
@@ -111,28 +103,7 @@ jobs:
       - name: Package and publish rolling release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -e
-          [ -s data/kilimall.db ] || { echo "[guard] DB missing — refusing to publish an empty snapshot"; exit 1; }
-          rows=$(python -c "import sqlite3; print(sqlite3.connect('data/kilimall.db').execute('select count(*) from listings').fetchone()[0])")
-          [ "$rows" -ge 1 ] || { echo "[guard] DB has 0 rows — refusing to publish"; exit 1; }
-          mkdir -p data/cold
-          python - <<'PY'
-          import os, sqlite3
-          live, cold = 'data/kilimall.db', 'data/cold/kilimall.db'
-          s = sqlite3.connect(live); d = sqlite3.connect(cold)
-          s.backup(d); d.execute("PRAGMA wal_checkpoint(TRUNCATE)"); d.close(); s.close()
-          PY
-          (cd data/cold && python -c "import zipfile; zipfile.ZipFile('../kilimall.db.zip','w',zipfile.ZIP_DEFLATED).write('kilimall.db')")
-          snap="data/snapshot-$(date +%F).parquet"
-          if [ -f "$snap" ]; then cp "$snap" data/kilimall-live-latest.parquet; fi
-          (cd data && sha256sum kilimall.db.zip kilimall-live-latest.parquet | sed 's/ .*\///' > SHA256SUMS)
-          if gh release view live-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then :; else
-            gh release create live-latest --repo "$GITHUB_REPOSITORY" --title 'Live dataset (rolling)' --prerelease \
-              --notes 'Rolling live delta collected on GitHub-hosted runners (robots-compliant: sitemap + /listing JSON-LD only).'
-          fi
-          gh release upload live-latest data/kilimall.db.zip data/kilimall-live-latest.parquet data/SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
-
+        run: bash scripts/ci_publish.sh
       - name: Monthly immutable rollup (1st of month)
         env:
           GH_TOKEN: ${{ github.token }}

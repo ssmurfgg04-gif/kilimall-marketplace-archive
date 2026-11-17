@@ -148,7 +148,21 @@ def main():
     ap.add_argument("--dmin", type=float, default=3.0)
     ap.add_argument("--dmax", type=float, default=8.0)
     ap.add_argument("--snapshot", action="store_true", default=True)
+    ap.add_argument("--no-snapshot", dest="snapshot", action="store_false")
+    ap.add_argument("--shard", type=int, default=0, help="this leg's index (live legs)")
+    ap.add_argument("--shards", type=int, default=1, help="number of parallel live legs")
+    ap.add_argument("--skip-seen-hours", type=float, default=0,
+                    help="mode=all: skip SKUs collected within the last N hours")
+    ap.add_argument("--deadline-min", type=float, default=0,
+                    help="stop cleanly after N minutes (0 = no limit)")
+    ap.add_argument("--commit-every", type=int, default=25)
     args = ap.parse_args()
+    t_end = time.monotonic() + args.deadline_min * 60 if args.deadline_min else None
+
+    def mine(sku):
+        if args.shards <= 1:
+            return True
+        return int(blake3.blake3(str(sku).encode()).hexdigest()[:8], 16) % args.shards == args.shard
 
     Path(args.db).parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(args.db, timeout=120)
@@ -180,6 +194,8 @@ def main():
                 if skipped < args.offset:
                     skipped += 1
                     continue
+                if not mine(sku):
+                    continue
                 if sku in seen and lastmod <= db_max:
                     continue
                 items.append((sku, url, lastmod))
@@ -195,25 +211,42 @@ def main():
             for g, u in oldest:
                 if g not in already:
                     items.append((g, u, ""))
-    else:  # all / backfill sweep (page with --offset)
-        items = []
+    else:  # all / backfill sweep (page with --offset); live legs use --shard/--shards
+        last = dict(db.execute("select guid, last_seen from listings").fetchall())
+        cutoff = ""
+        if args.skip_seen_hours:
+            from datetime import timedelta
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=args.skip_seen_hours)).isoformat(timespec="seconds")
+        unseen, stale = [], []
         skipped = 0
         with open(args.index, encoding="utf-8") as f:
             next(f)
             for line in f:
                 parts = line.rstrip("\n").split("\t")
-                if not parts[0]:
+                if not parts[0] or not mine(parts[0]):
                     continue
                 if skipped < args.offset:
                     skipped += 1
                     continue
-                items.append(tuple(parts[:3]))
-                if len(items) >= args.max_items:
-                    break
+                seen_at = last.get(parts[0])
+                if seen_at is None:
+                    unseen.append(tuple(parts[:3]))
+                elif not cutoff or seen_at < cutoff:
+                    stale.append((seen_at,) + tuple(parts[:3]))
+        stale.sort()  # stalest first
+        items = (unseen + [r[1:] for r in stale])[: args.max_items]
+        print(f"leg {args.shard}/{args.shards}: unseen={len(unseen)} stale={len(stale)}")
 
     print(f"collecting {len(items)} listings (mode={args.mode})")
-    new = changed = gone = 0
+    new = changed = gone = done_n = 0
     for sku, url, _lastmod in items:
+        if t_end and time.monotonic() > t_end:
+            print(f"deadline reached after {done_n} items — stopping cleanly")
+            break
+        done_n += 1
+        if done_n % args.commit_every == 0:
+            db.commit()
+            print(f"  progress {done_n}/{len(items)} new={new} changed={changed} gone={gone}", flush=True)
         try:
             html, status = fetch(url)
         except RuntimeError as e:

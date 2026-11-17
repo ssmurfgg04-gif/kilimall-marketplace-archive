@@ -1,18 +1,44 @@
 name: CC body drain (hosted legs, manual)
 
-# Phase 2 of the Common Crawl harvest: fetch byte ranges for manifest captures
-# and parse JSON-LD inline. 20 legs, ~5-6k captures each, adaptive throttle.
-# WARC bodies come from data.commoncrawl.org (CC's CDN) — zero requests to kilimall.co.ke.
-# Precondition: run cc_layer0.py + cc_partition.py and commit data/warc_shards/.
-# Trigger: workflow_dispatch only. Re-dispatch a failed/timed-out shard; committed
-# part DBs persist in artifacts (if: always()).
+# One dispatch = two kinds of parallel legs, merged into live-latest at the end.
+#
+#  CC legs   (warc-part-*): Common Crawl history. Byte-range WARC fetches from
+#            data.commoncrawl.org only — zero requests to kilimall.co.ke.
+#            Seeded from the release, so captures already archived (warc_item /
+#            cc_done) are skipped; a re-dispatch only fetches what is missing.
+#            Fewer, gentler connections + shared adaptive backoff (CC's CDN
+#            429s/503s heavily if hit with ~80 parallel connections).
+#
+#  Live legs (live-part-*): use the runner slots the CC legs no longer need to
+#            re-check the live site. robots-compliant (sitemap + /listing/*
+#            JSON-LD only, never /api). Each leg = 1 worker, 3-8 s random gap,
+#            its own hash-slice of the sitemap index; unseen SKUs first, then
+#            the stalest. Skips anything collected in the last `skip_seen_hours`.
+#
+#  merge:    downloads all parts, merges, publishes, tags cc-merge-done-<run>.
+#            The watchdog (cc-merge-retry.yml) re-runs it if this job fails.
 
 on:
   workflow_dispatch:
     inputs:
       shards:
-        description: "Shard indexes, e.g. 0,1,2 or 'all'"
+        description: "CC shard indexes, e.g. 0,1,2 or 'all' or 'none'"
         default: "all"
+      cc_parallel:
+        description: "CC legs running at once (CDN politeness)"
+        default: "8"
+      cc_workers:
+        description: "Fetch threads per CC leg"
+        default: "2"
+      live_legs:
+        description: "Live-site legs (0 = off). Each is 1 worker at 3-8 s per page"
+        default: "1"
+      live_items:
+        description: "Max live pages per leg"
+        default: "250"
+      skip_seen_hours:
+        description: "Live legs skip SKUs collected within this many hours"
+        default: "72"
 
 permissions:
   contents: read
@@ -25,24 +51,31 @@ jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.m.outputs.matrix }}
+      cc: ${{ steps.m.outputs.cc }}
+      live: ${{ steps.m.outputs.live }}
     steps:
       - id: m
+        env:
+          SHARDS: ${{ inputs.shards }}
+          LIVE: ${{ inputs.live_legs }}
         run: |
-          if [ "${{ inputs.shards }}" = "all" ]; then
-            echo 'matrix=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]' >> "$GITHUB_OUTPUT"
-          else
-            echo "matrix=[${{ inputs.shards }}]" >> "$GITHUB_OUTPUT"
-          fi
+          case "$SHARDS" in
+            all)  echo 'cc=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]' >> "$GITHUB_OUTPUT" ;;
+            none|"") echo 'cc=[]' >> "$GITHUB_OUTPUT" ;;
+            *)    echo "cc=[$SHARDS]" >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "live=$(python3 -c "import json,sys; print(json.dumps(list(range(int(sys.argv[1] or 0)))))" "$LIVE")" >> "$GITHUB_OUTPUT"
+
   drain:
     needs: setup
+    if: needs.setup.outputs.cc != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
       fail-fast: false
-      max-parallel: 20
+      max-parallel: ${{ fromJson(inputs.cc_parallel) }}
       matrix:
-        shard: ${{ fromJson(needs.setup.outputs.matrix) }}
+        shard: ${{ fromJson(needs.setup.outputs.cc) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -51,12 +84,17 @@ jobs:
       - run: pip install requests blake3 duckdb
       - name: Pad shard
         run: echo "SHARD=$(printf '%02d' ${{ matrix.shard }})" >> "$GITHUB_ENV"
+      - name: Seed archive DB (to skip captures already merged)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci_seed.sh
       - name: Fetch shard
         run: |
           python scripts/warc_fetch.py \
             --shard-file data/warc_shards/kilimall_shard_${{ env.SHARD }}.tsv \
             --out-db /tmp/warc_part_${{ env.SHARD }}.db \
-            --workers 4 --delay 0.5 --batch 250 --max 6000
+            --skip-db data/kilimall.db \
+            --workers ${{ inputs.cc_workers }} --delay 0.5 --deadline-min 280
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -65,12 +103,59 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  live:
+    needs: setup
+    if: needs.setup.outputs.live != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: ${{ fromJson(needs.setup.outputs.live) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install blake3 duckdb requests
+      - name: Restore sitemap index cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: kilimall-data-v1-${{ github.run_id }}
+          restore-keys: kilimall-data-v1-
+      - name: Seed DB from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci_seed.sh
+      - name: Build sitemap index if missing
+        run: '[ -f data/url_index.tsv ] || python scripts/kilimall_sitemap.py'
+      - name: Mark leg start
+        run: |
+          python -c "import sqlite3,datetime; d=sqlite3.connect('data/kilimall.db'); d.execute('create table if not exists leg_meta(started_at TEXT)'); d.execute('insert into leg_meta values(?)',(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),)); d.commit()"
+      - name: Collect live slice
+        run: |
+          python scripts/kilimall_incremental.py --mode all \
+            --shard ${{ matrix.leg }} --shards ${{ inputs.live_legs }} \
+            --max-items ${{ inputs.live_items }} --skip-seen-hours ${{ inputs.skip_seen_hours }} \
+            --deadline-min 270 --no-snapshot --dmin 3 --dmax 8
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-part-${{ matrix.leg }}
+          path: data/kilimall.db
+          retention-days: 7
+          if-no-files-found: ignore
+
   merge:
-    # Runs after the legs — even if some failed; artifacts from successful legs persist.
-    needs: drain
+    needs: [drain, live]
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
+    # same group as live-delta/backfill: only one job ever writes the release at a time
+    concurrency:
+      group: kilimall-live
+      cancel-in-progress: false
     permissions:
       contents: write
       actions: read
@@ -80,44 +165,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install requests duckdb blake3
-      - name: Download part DBs from this run
+      - name: Merge all parts, publish, tag
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p /tmp/warc-parts
-          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern "warc-part-*" --dir /tmp/warc-parts
-          find /tmp/warc-parts -name '*.db' | wc -l
-      - name: Seed DB from rolling release
-        run: |
-          mkdir -p data
-          if curl -fsSL -o data/kilimall.db.zip "https://github.com/${{ github.repository }}/releases/download/live-latest/kilimall.db.zip"; then
-            python -c "import zipfile; zipfile.ZipFile('data/kilimall.db.zip').extractall('data')" && rm data/kilimall.db.zip
-            echo "seeded from rolling release"
-          else
-            echo "no prior DB — merge creates schema"
-          fi
-      - name: Merge parts into kilimall.db
-        run: python scripts/warc_merge.py --part-dir /tmp/warc-parts
-      - name: Backfill categories from CC breadcrumbs
-        run: python scripts/backfill_categories.py
-      - name: Publish enriched live-latest release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -e
-          [ -s data/kilimall.db ] || { echo "[guard] DB missing"; exit 1; }
-          mkdir -p data/cold
-          python - <<'PY'
-          import os, sqlite3
-          live, cold = 'data/kilimall.db', 'data/cold/kilimall.db'
-          s = sqlite3.connect(live); d = sqlite3.connect(cold)
-          s.backup(d); d.execute("PRAGMA wal_checkpoint(TRUNCATE)"); d.close(); s.close()
-          PY
-          (cd data/cold && python -c "import zipfile; zipfile.ZipFile('../kilimall.db.zip','w',zipfile.ZIP_DEFLATED).write('kilimall.db')")
-          cd data && cp "snapshot-$(date +%F).parquet" kilimall-live-latest.parquet 2>/dev/null || true
-          sha256sum kilimall.db.zip kilimall-live-latest.parquet 2>/dev/null | sed 's/ .*\///' > SHA256SUMS || true
-          if gh release view live-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then :; else
-            gh release create live-latest --repo "$GITHUB_REPOSITORY" --title 'Live dataset (rolling)' --prerelease \
-              --notes 'Rolling live dataset (live delta + Common Crawl harvest).'
-          fi
-          gh release upload live-latest data/kilimall.db.zip kilimall-live-latest.parquet SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+        run: bash scripts/ci_merge_run.sh "$GITHUB_RUN_ID"
