@@ -10,8 +10,13 @@ set -euo pipefail
 rid="$1"
 rm -rf /tmp/warc-parts /tmp/live-parts
 mkdir -p /tmp/warc-parts /tmp/live-parts
-gh run download "$rid" --repo "$GITHUB_REPOSITORY" --pattern "warc-part-*" --dir /tmp/warc-parts || echo "no warc parts"
-gh run download "$rid" --repo "$GITHUB_REPOSITORY" --pattern "live-part-*" --dir /tmp/live-parts || echo "no live parts"
+# parts come from the cc-parts release (Actions artifact egress blew the cap once;
+# release assets don't draw on it)
+mkdir -p /tmp/warc-parts /tmp/live-parts
+(cd /tmp/warc-parts && gh release download cc-parts --repo "$GITHUB_REPOSITORY" --pattern 'cc-part-*.db.gz' --clobber) || echo "no cc parts on the cc-parts release"
+(cd /tmp/live-parts && gh release download cc-parts --repo "$GITHUB_REPOSITORY" --pattern 'live-part-*.db.gz' --clobber) || echo "no live parts on the cc-parts release"
+find /tmp/warc-parts /tmp -maxdepth 2 -name '*.db.gz' -exec gunzip -f {} \;
+find /tmp/live-parts -maxdepth 1 -name '*.db.gz' -exec gunzip -f {} \;
 nw=$(find /tmp/warc-parts -name '*.db' | wc -l); nl=$(find /tmp/live-parts -name '*.db' | wc -l)
 echo "run $rid: $nw CC part DBs, $nl live part DBs"
 if [ "$nw" -eq 0 ] && [ "$nl" -eq 0 ]; then echo "::error::no part DBs in run $rid"; exit 1; fi

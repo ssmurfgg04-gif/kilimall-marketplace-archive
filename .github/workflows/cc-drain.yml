@@ -41,7 +41,7 @@ on:
         default: "72"
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: cc-drain
@@ -95,13 +95,17 @@ jobs:
             --out-db /tmp/warc_part_${{ env.SHARD }}.db \
             --skip-db data/kilimall.db \
             --workers ${{ inputs.cc_workers }} --delay 0.5 --deadline-min 280
-      - uses: actions/upload-artifact@v4
+      - name: Publish part DB to rolling cc-parts release
         if: always()
-        with:
-          name: warc-part-${{ matrix.shard }}
-          path: /tmp/warc_part_${{ env.SHARD }}.db
-          retention-days: 7
-          if-no-files-found: ignore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gzip -9 -c /tmp/warc_part_${{ env.SHARD }}.db > "/tmp/cc-part-${{ env.SHARD }}.db.gz"
+          ls -la "/tmp/cc-part-${{ env.SHARD }}.db.gz"
+          gh release view cc-parts --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create cc-parts --repo "$GITHUB_REPOSITORY" --title 'CC harvest parts (rolling)' --prerelease \
+              --notes 'Per-leg part DBs (gzipped). Consumed by the merge job. Idempotent with --clobber.'
+          gh release upload cc-parts "/tmp/cc-part-${{ env.SHARD }}.db.gz" --clobber --repo "$GITHUB_REPOSITORY"
 
   live:
     needs: setup
@@ -139,13 +143,17 @@ jobs:
             --shard ${{ matrix.leg }} --shards ${{ inputs.live_legs }} \
             --max-items ${{ inputs.live_items }} --skip-seen-hours ${{ inputs.skip_seen_hours }} \
             --deadline-min 270 --no-snapshot --dmin 3 --dmax 8
-      - uses: actions/upload-artifact@v4
+      - name: Publish live part DB to rolling cc-parts release
         if: always()
-        with:
-          name: live-part-${{ matrix.leg }}
-          path: data/kilimall.db
-          retention-days: 7
-          if-no-files-found: ignore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gzip -9 -c data/kilimall.db > "/tmp/live-part-${{ matrix.leg }}.db.gz"
+          ls -la "/tmp/live-part-${{ matrix.leg }}.db.gz"
+          gh release view cc-parts --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create cc-parts --repo "$GITHUB_REPOSITORY" --title 'CC harvest parts (rolling)' --prerelease \
+              --notes 'Per-leg part DBs (gzipped). Consumed by the merge job. Idempotent with --clobber.'
+          gh release upload cc-parts "/tmp/live-part-${{ matrix.leg }}.db.gz" --clobber --repo "$GITHUB_REPOSITORY"
 
   merge:
     needs: [drain, live]
