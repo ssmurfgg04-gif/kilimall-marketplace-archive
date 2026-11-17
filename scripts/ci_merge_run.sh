@@ -15,7 +15,7 @@ mkdir -p /tmp/warc-parts /tmp/live-parts
 mkdir -p /tmp/warc-parts /tmp/live-parts
 (cd /tmp/warc-parts && gh release download cc-parts --repo "$GITHUB_REPOSITORY" --pattern 'cc-part-*.db.gz' --clobber) || echo "no cc parts on the cc-parts release"
 (cd /tmp/live-parts && gh release download cc-parts --repo "$GITHUB_REPOSITORY" --pattern 'live-part-*.db.gz' --clobber) || echo "no live parts on the cc-parts release"
-find /tmp/warc-parts /tmp -maxdepth 2 -name '*.db.gz' -exec gunzip -f {} \;
+find /tmp/warc-parts -maxdepth 1 -name '*.db.gz' -exec gunzip -f {} \;
 find /tmp/live-parts -maxdepth 1 -name '*.db.gz' -exec gunzip -f {} \;
 nw=$(find /tmp/warc-parts -name '*.db' | wc -l); nl=$(find /tmp/live-parts -name '*.db' | wc -l)
 echo "run $rid: $nw CC part DBs, $nl live part DBs"
