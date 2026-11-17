@@ -86,6 +86,14 @@ Logs: `logs/` (gitignored). All paths env-overridable via `KILIMALL_ROOT`.
 | Deal hunting | price < k × trailing category average | needs category derivation from breadcrumb metadata (not in JSON-LD) |
 | Risk/views | seller/store metadata from `store-01` sitemap + listing pages | views not exposed server-side; proxies only |
 
+## Provenance notes (2026-11-17)
+
+- Merge `a434412` landed the adaptive-throttle drain + seed-from-release refactor.
+- Live delta accumulating: 200 listings in live-latest (2026-11-17), GH-hosted, 15 items/run, 6x/day EAT.
+- CC harvest round 1 (2026-11-16): 32/32 crawl index shards harvested (20,343 captures indexed);
+  body legs were throttled to zero by CC at the time; round 2 re-dispatched 2026-11-17 on the
+  adaptive-throttle code (shards committed; cc_parallel=8; CDN byte-range only, zero kilimall.co.ke traffic).
+
 ## Provenance notes (2026-11-16)
 
 - Seeded 2026-11-16: 40 newest listings (all priced KES, all InStock in sample).
