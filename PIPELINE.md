@@ -96,8 +96,11 @@ Logs: `logs/` (gitignored). All paths env-overridable via `KILIMALL_ROOT`.
 
 ## Provenance notes (2026-11-16)
 
-- Seeded 2026-11-16: 40 newest listings (all priced KES, all InStock in sample).
-- First GH-hosted delta run id 43817963960 (after requirements.txt pip-cache fix).
+- 2026-11-16: Seeded 40 listings; first GH-hosted delta run id 43817963960 (after requirements.txt pip-cache fix).
+- 2026-11-17: Trial deep sweep (4 legs × 250 pages) merged → live-latest DB: 1,200 listings,
+  17,233 warc_item captures (CC harvest applied), 1,150/1,200 listings with category breadcrumbs.
+- 2026-11-17: Full 20-leg fleet dispatch (inputs legs=20, max_items=2500) — in flight.
+- CC harvest: ~17K captures merged from sharded WARC ranges (2024-09 → 2026-10).
 - Coverage = sitemap index (344,841 URLs, lastmod 2026-11-14) + delta accumulation.
   Historical (pre-2026-11-16) prices NOT included; requires Common Crawl mining.
 - Every price carries first_seen/last_seen; every observation lands in price_history.

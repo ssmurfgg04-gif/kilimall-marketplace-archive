@@ -11,10 +11,10 @@ An auditable, provenance-first snapshot of public Kilimall (kilimall.co.ke) prod
 
 `robots.txt` **disallows `/api/*`** — this pipeline never calls the API. Listing pages and the sitemap are allowed. One worker, random 3–8s delays, in-flight cap (`--max-items`, default 60). Do not run collectors aggressively.
 
-## Current inventory (2026-11-16)
+## Current inventory (2026-11-17)
 
-- Live `listings`: accumulates from polite deltas (see Release `live-latest`).
-- `warc_item`: Common Crawl captures of /listing/* pages (2024→2026) —
+- Live `listings`: 1,200 (as of release 2026-11-17 14:32 EAT).
+- `warc_item`: 17,233 captures (2024-09 → 2026-10). Common Crawl captures of /listing/* pages (2024→2026) —
   ~20,343 captures at first harvest; byte-range fetched from CC's CDN,
   zero requests to kilimall.co.ke. Capture timestamps = original crawl times.
 - `price_history`: every observation; `source='commoncrawl'` for CC-mined rows.
