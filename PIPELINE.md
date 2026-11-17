@@ -171,3 +171,23 @@ artifact egress. Watchdog + ci_merge_run are quota-safe.
 - Monthly: day-01 robots check + immutable vYYYY-MM-DD rollup (in live-delta).
 - Tokens: GitHub PAT stored in KeePass (`jiji-marketplace-archive-github-token`)
   — rotate when convenient; transcript exposure acknowledged.
+
+## Traffic context (Similarweb, September/October 2026)
+
+- Global rank #85,048 → #91,859, Kenya #171 → #183. Category Rank ~#235 (Gambling-other, mis-categorized).
+- ~440K visits / 3 months ≈ 147K/month; pages/visit 5.04 → ~740K pageviews/mo ≈ 25K/day.
+- Traffic source: Direct 40.6%, Organic Search #2, Referrals #3
+- Audience: 91.99% Kenya, 66.6% male, 25-34 top bracket, +7-9% MoM growth
+- Company: $10-15M/yr rev, 201-500 FTE, HQ Nairobi. Kilimall is small enough that the
+  *archive* is actually denser and more complete than public-market intel on them.
+
+Implication: a 300-pageburst from a residential IP ≈ 1% of their daily load. Even sustained
+5 rps load from this connection ≈ 25% of their daily load per hour — acceptable politeness margin.
+Fleet harvest (20 legs × 17K pages in one dispatch) ≈ 2 days of their normal traffic volume.
+
+## Fleet deep sweep (backfill.yml, dispatched 2026-11-17)
+
+- 20 legs × hash-shard of the 344,841-URL sitemap index; unseen-then-stale order
+- robots-compliant always (no /api, no login, one worker per leg, 3-8s delays)
+- Legs `if: always()` upload cc-parts/live-part-*.db.gz to the rolling release, merge job
+  tags cc-merge-done-<run-id>. Trial dispatch (4×250 pages) validating first.
