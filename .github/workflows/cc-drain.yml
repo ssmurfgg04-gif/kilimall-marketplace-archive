@@ -32,10 +32,10 @@ on:
         default: "2"
       live_legs:
         description: "Live-site legs (0 = off). Each is 1 worker at 3-8 s per page"
-        default: "4"
+        default: "1"
       live_items:
         description: "Max live pages per leg"
-        default: "2500"
+        default: "250"
       skip_seen_hours:
         description: "Live legs skip SKUs collected within this many hours"
         default: "72"
