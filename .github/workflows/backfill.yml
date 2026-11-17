@@ -1,21 +1,22 @@
-name: Deep backfill sweep (manual)
+name: Deep backfill sweep (manual, 20 legs)
 
-# Opt-in ONLY: workflow_dispatch. Not scheduled.
-# Polite deep sweep: --offset pages you through the 344k-url index; each dispatch
-# advances coverage (e.g. offset=250, 500, ...). 250/night ≈ 3.8 YEARS for full
-# coverage — the delta path is the right tool for tracking; this is for recovery.
+# One-time/on demand FULL catalog harvest. 20 legs, hash-sharded; each leg
+# grabs its slice of the sitemap index, unseen SKUs first, stale last.
+# robots-compliant always (never /api/*). ~1 worker/leg, 3–8s delays.
+# ~15–20K pages per leg → ~300K+ pages per dispatch, several hours.
+# Manual trigger only. Merge job publishes afterwards (tags cc-merge-done-*).
 
 on:
   workflow_dispatch:
     inputs:
-      offset:
-        description: 'Skip first N index entries (page this sweep forward)'
-        required: true
-        default: '0'
       max_items:
-        description: 'Items this sweep (polite cap)'
+        description: "Max pages per leg (default 2000; ~40K pages/dispatch)"
         required: false
-        default: '250'
+        default: "2000"
+      legs:
+        description: "Parallel live legs (default 20)"
+        required: false
+        default: "20"
 
 permissions:
   contents: write
@@ -25,46 +26,65 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  sweep:
+  setup:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    outputs:
+      live: ${{ steps.m.outputs.live }}
+    steps:
+      - id: m
+        run: echo "live=$(python3 -c "import json,sys; print(json.dumps(list(range(int(sys.argv[1] or 20)))))" "${{ inputs.legs }}")" >> "$GITHUB_OUTPUT"
+
+  drain:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        leg: ${{ fromJson(needs.setup.outputs.live) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-      - run: pip install blake3 duckdb
+          python-version: "3.12"
+      - run: pip install blake3 duckdb requests
 
-      - name: Restore sitemap index + DB cache
-        uses: actions/cache/restore@v4
-        with:
-          path: data
-          key: kilimall-data-v1-${{ github.run_id }}
-          restore-keys: kilimall-data-v1-
-
-      - name: Seed DB from rolling release (always — release is the source of truth)
+      - name: Seed DB from rolling release
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/ci_seed.sh
       - name: Build sitemap index if missing
         run: '[ -f data/url_index.tsv ] || python scripts/kilimall_sitemap.py'
-
-      - name: Backfill sweep
+      - name: Mark leg start
+        run: |
+          python -c "import sqlite3,datetime; d=sqlite3.connect('data/kilimall.db'); d.execute('create table if not exists leg_meta(started_at TEXT)'); d.execute('insert into leg_meta values(?)',(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),)); d.commit()"
+      - name: Sweep leg
         env:
-          OFFSET: ${{ inputs.offset }}
-          MAX_ITEMS: ${{ inputs.max_items || '250' }}
-        run: python scripts/kilimall_incremental.py --mode all --offset "$OFFSET" --max-items "$MAX_ITEMS"
-
-      - name: Mark dead listings (14d stale)
-        run: python scripts/data_quality.py --days 14 || true
-
-      - name: Package and publish rolling release
+          MAX_ITEMS: ${{ inputs.max_items || '2000' }}
+        run: |
+          python scripts/kilimall_incremental.py --mode all \
+            --shard ${{ matrix.leg }} --shards ${{ inputs.legs || '20' }} \
+            --max-items "$MAX_ITEMS" --dmin 1 --dmax 3 --deadline-min 320 --no-snapshot
+      - name: Publish live part DB to cc-parts release
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash scripts/ci_publish.sh
-      - name: Save data cache
-        if: always()
-        uses: actions/cache/save@v4
+        run: |
+          gzip -9 -c data/kilimall.db > "/tmp/live-part-${{ matrix.leg }}.db.gz"
+          gh release upload cc-parts "/tmp/live-part-${{ matrix.leg }}.db.gz" --clobber --repo "$GITHUB_REPOSITORY"
+  merge:
+    needs: drain
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          path: data
-          key: kilimall-data-v1-${{ github.run_id }}
+          python-version: '3.12'
+      - run: pip install requests duckdb blake3
+      - name: Merge parts and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci_merge_run.sh "$GITHUB_RUN_ID"
