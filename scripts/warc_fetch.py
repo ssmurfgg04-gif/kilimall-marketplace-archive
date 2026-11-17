@@ -5,8 +5,18 @@ Byte-range requests only to data.commoncrawl.org (never kilimall.co.ke).
 Body -> JSON-LD (same ItemPage/Product extractor as the live collector) ->
 part SQLite /tmp/warc_part_<shard>.db (table warc_item).
 
+Speed/robustness (2026-11-17):
+  - --skip-db: skip captures already in the archive (warc_item / cc_done), so a
+    re-run only fetches what is still missing.
+  - Shared adaptive throttle: 429/5xx doubles the gap between requests for ALL
+    workers (honours Retry-After); successes slowly shrink it again.
+  - 8 attempts with exponential backoff + jitter, then a slow final retry pass.
+  - `done` records status ('ok' | 'nodata') so captures with no product data
+    are not re-fetched forever.
+  - --deadline-min: stop cleanly before the job timeout so the part DB is kept.
+
 Usage: python scripts/warc_fetch.py --shard-file data/warc_shards/kilimall_shard_00.tsv \
-        --out-db /tmp/warc_part_00.db --workers 4 --delay 0.5 [--max 6000] [--batch 250]
+        --out-db /tmp/warc_part_00.db [--skip-db data/kilimall.db] [--workers 2] [--deadline-min 280]
 """
 import argparse
 import gzip
@@ -59,7 +69,7 @@ def parse_legacy(html, url=""):
     }
 
 CC = "https://data.commoncrawl.org/"
-UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) kilimall-archive-miner/0.2 (+contact: research)"}
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) kilimall-archive-miner/0.3 (+https://github.com/ssmurfgg04-gif/kilimall-marketplace-archive)"}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS warc_item(
   url TEXT, capture_ts TEXT, digest TEXT, sku TEXT, title TEXT, price REAL,
@@ -69,105 +79,220 @@ CREATE TABLE IF NOT EXISTS warc_item(
 CREATE TABLE IF NOT EXISTS done(url TEXT, capture_ts TEXT, PRIMARY KEY(url, capture_ts));
 """
 LOCK = threading.Lock()
+STOP = threading.Event()
+STATS = {"ok": 0, "nodata": 0, "retry_429": 0, "retry_5xx": 0, "fail": 0, "deferred": 0}
+
+
+class Throttle:
+    """Pacing shared by every worker in this process.
+
+    CC's CDN throws intermittent 503s / broken reads (~30% at times) that an
+    immediate retry usually fixes, so single errors are NOT punished globally.
+    The gap only grows while the recent error RATE is high (sustained
+    throttling), and shrinks quickly once it drops. Retry-After is honoured.
+    """
+
+    def __init__(self, base, cap=20.0, window=40):
+        self.base, self.cap, self.gap = base, cap, base
+        self.until = 0.0
+        self.recent = []
+        self.window = window
+        self.lock = threading.Lock()
+
+    def wait(self):
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                if now >= self.until:
+                    self.until = now + self.gap * random.uniform(0.7, 1.3)
+                    return
+                pause = self.until - now
+            time.sleep(min(pause, 5))
+
+    def _note(self, ok):
+        self.recent.append(ok)
+        if len(self.recent) > self.window:
+            self.recent.pop(0)
+        if len(self.recent) < 10:
+            return
+        err = 1 - sum(self.recent) / len(self.recent)
+        if err > 0.75:
+            self.gap = min(self.cap, self.gap * 1.5)
+        elif err < 0.55:
+            self.gap = max(self.base, self.gap * 0.7)
+
+    def ok(self):
+        with self.lock:
+            self._note(True)
+
+    def backoff(self, retry_after=None):
+        with self.lock:
+            self._note(False)
+            if retry_after:
+                self.until = max(self.until, time.monotonic() + min(retry_after, 120))
 
 
 def fetch_range(fn, off, ln, sess):
     off, ln = int(off), int(ln)
     try:
-        r = sess.get(CC + fn, headers={"Range": f"bytes={off}-{off + ln - 1}"},
-                     timeout=60, stream=False)
+        r = sess.get(CC + fn, headers={"Range": f"bytes={off}-{off + ln - 1}", **UA}, timeout=60)
     except requests.RequestException:
-        return "fail", None
-    if r.status_code == 429 or r.status_code in (502, 503, 504):
-        return "retry", None
+        return "retry_5xx", None, None
+    if r.status_code == 429 or r.status_code in (500, 502, 503, 504):
+        ra = r.headers.get("Retry-After")
+        try:
+            ra = float(ra) if ra else None
+        except ValueError:
+            ra = None
+        return ("retry_429" if r.status_code == 429 else "retry_5xx"), None, ra
     if r.status_code not in (200, 206):
-        return "fail", None
+        return "fail", None, None
     raw = r.content
     try:
         html = gzip.GzipFile(fileobj=io.BytesIO(raw)).read().decode("utf-8", "replace")
     except Exception:
-        # CC WARC records sometimes arrive zlib-compressed or as plain gzip;
-        # try raw deflate as fallback.
         try:
             import zlib
             html = zlib.decompress(raw).decode("utf-8", "replace")
         except Exception:
-            return "fail", None
-    return "ok", html
+            return "fail", None, None
+    return "ok", html, None
 
 
-def worker(sh, rows, db_path, delay):
-    sess = requests.Session()
-    for (fn, off, ln, url, ts, mime, key) in rows:
-        status = None
-        for attempt in range(3):
-            status, html = fetch_range(fn, off, ln, sess)
-            if status == "ok":
-                break
-            time.sleep((attempt + 1) * (1 + random.random()))
-        if status != "ok":
-            print(f"  [skip {status}] {url}", flush=True)
-            time.sleep(delay)
-            continue
-        p = parse_product(html)
-        if p:
-            r_ = record(p)
-        else:
-            r_ = parse_legacy(html, url)
-            if not r_["title"] and r_["price"] is None:
-                print(f"  [no product data (ld+json or OG)] {url}", flush=True)
-                time.sleep(delay)
-                continue
-        with LOCK:
-            db = sqlite3.connect(db_path)
+def save(db_path, url, ts, key, r_, status):
+    with LOCK:
+        db = sqlite3.connect(db_path, timeout=60)
+        if r_ is not None:
             db.execute(
                 "insert or ignore into warc_item values(?,?,?,?,?,?,?,?,?,?,?)",
                 (url, ts, key, r_["guid"], r_["title"], r_["price"], r_["currency"],
                  r_["availability"], r_["brand"], r_["category"], r_["description"]))
-            db.execute("insert or ignore into done values(?,?)", (url, ts))
-            db.commit()
-            db.close()
-        time.sleep(delay)
+        db.execute("insert or replace into done(url, capture_ts, status) values(?,?,?)", (url, ts, status))
+        db.commit()
+        db.close()
+
+
+def process(row, sess, thr, db_path, attempts):
+    fn, off, ln, url, ts, _mime, key = row[:7]
+    status = "fail"
+    for attempt in range(attempts):
+        if STOP.is_set():
+            return "stopped"
+        thr.wait()
+        status, html, ra = fetch_range(fn, off, ln, sess)
+        if status == "ok":
+            thr.ok()
+            break
+        with LOCK:
+            STATS[status] = STATS.get(status, 0) + 1
+        if status == "fail":
+            break
+        thr.backoff(ra)
+        time.sleep(min(30, 0.5 * (2 ** attempt) * random.uniform(0.5, 1.5)))
+    if status != "ok":
+        return status
+    p = parse_product(html)
+    r_ = record(p) if p else parse_legacy(html, url)
+    if not p and not r_["title"] and r_["price"] is None:
+        save(db_path, url, ts, key, None, "nodata")
+        with LOCK:
+            STATS["nodata"] += 1
+        return "nodata"
+    save(db_path, url, ts, key, r_, "ok")
+    with LOCK:
+        STATS["ok"] += 1
+    return "ok"
+
+
+def run_pool(rows, workers, thr, db_path, attempts, deadline):
+    q = list(rows)
+    deferred = []
+    qlock = threading.Lock()
+
+    def loop():
+        sess = requests.Session()
+        while not STOP.is_set():
+            if time.monotonic() > deadline:
+                STOP.set()
+                break
+            with qlock:
+                if not q:
+                    return
+                row = q.pop()
+            res = process(row, sess, thr, db_path, attempts)
+            if res not in ("ok", "nodata", "stopped"):
+                with qlock:
+                    deferred.append(row)
+
+    ts = [threading.Thread(target=loop, daemon=True) for _ in range(max(1, workers))]
+    for t in ts:
+        t.start()
+    total = len(rows)
+    while any(t.is_alive() for t in ts):
+        time.sleep(30)
+        with LOCK:
+            print(f"  progress: left={len(q)}/{total} gap={thr.gap:.2f}s {STATS}", flush=True)
+    return deferred
+
+
+def load_skip(path):
+    if not path or not os.path.exists(path):
+        return set()
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    have = set()
+    for t in ("warc_item", "cc_done"):
+        try:
+            have |= set(db.execute(f"select url, capture_ts from {t}"))
+        except sqlite3.Error:
+            pass
+    db.close()
+    return have
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--shard-file", required=True)
     ap.add_argument("--out-db", required=True)
-    ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--delay", type=float, default=0.5)
-    ap.add_argument("--batch", type=int, default=250)
-    ap.add_argument("--max", type=int, default=6000)
+    ap.add_argument("--skip-db", help="archive DB; captures already in it are skipped")
+    ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--delay", type=float, default=0.5, help="base gap between requests (shared)")
+    ap.add_argument("--attempts", type=int, default=8)
+    ap.add_argument("--max", type=int, default=100000)
+    ap.add_argument("--deadline-min", type=float, default=280)
+    ap.add_argument("--batch", type=int, default=0, help="ignored (kept for old callers)")
     args = ap.parse_args()
+    deadline = time.monotonic() + args.deadline_min * 60
 
     with sqlite3.connect(args.out_db) as db:
         db.executescript(SCHEMA)
+        if "status" not in {r[1] for r in db.execute("pragma table_info(done)")}:
+            db.execute("alter table done add column status TEXT default 'ok'")
 
     with open(args.shard_file, encoding="utf-8") as f:
         rows = [l.rstrip("\n").split("\t") for l in f if l.strip()]
     rows = [r for r in rows if len(r) >= 7]
-
-    # resume: skip captures already banked in this part db
     with sqlite3.connect(args.out_db) as db:
-        done = {(u, t) for (u, t) in db.execute("select url, capture_ts from done")}
-    rows = [r for r in rows if (r[3], r[4]) not in done][: args.max]
-    print(f"shard {os.path.basename(args.shard_file)}: {len(rows)} to fetch "
-          f"(done {len(done)})", flush=True)
+        done = set(db.execute("select url, capture_ts from done"))
+    skip = load_skip(args.skip_db)
+    todo = [r for r in rows if (r[3], r[4]) not in done and (r[3], r[4]) not in skip][: args.max]
+    random.shuffle(todo)  # spread requests over many WARC files
+    print(f"shard {os.path.basename(args.shard_file)}: {len(rows)} captures, "
+          f"{len(skip & {(r[3], r[4]) for r in rows})} already archived, {len(done)} done here, "
+          f"{len(todo)} to fetch", flush=True)
 
-    chunks = [rows[i:i + args.batch] for i in range(0, len(rows), args.batch)]
-    for i, chunk in enumerate(chunks):
-        threads = []
-        split = max(1, len(chunk) // args.workers)
-        for w in range(args.workers):
-            part = chunk[w * split:(w + 1) * split if w < args.workers - 1 else len(chunk)]
-            if not part:
-                continue
-            t = threading.Thread(target=worker, args=(None, part, args.out_db, args.delay))
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join()
-        print(f"  batch {i}: done ({min((i + 1) * args.batch, len(rows))}/{len(rows)})", flush=True)
+    thr = Throttle(args.delay)
+    deferred = run_pool(todo, args.workers, thr, args.out_db, args.attempts, deadline)
+    if deferred and not STOP.is_set():
+        print(f"retry pass: {len(deferred)} deferred captures, 1 worker, slower", flush=True)
+        time.sleep(30)
+        thr.gap = max(thr.gap, args.delay * 4)
+        deferred = run_pool(deferred, 1, thr, args.out_db, args.attempts + 2, deadline)
+    STATS["deferred"] = len(deferred)
+    print(f"done: {STATS} stopped_by_deadline={STOP.is_set()}", flush=True)
+    summ = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summ:
+        with open(summ, "a") as f:
+            f.write(f"### {os.path.basename(args.shard_file)}\n\n`{STATS}` deadline_hit={STOP.is_set()}\n")
 
 
 if __name__ == "__main__":

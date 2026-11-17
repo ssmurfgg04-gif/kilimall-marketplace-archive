@@ -44,6 +44,12 @@ CREATE TABLE IF NOT EXISTS warc_item(
 CREATE TABLE IF NOT EXISTS price_history (
   guid TEXT, seen_at TEXT, price REAL, hash TEXT, source TEXT
 );
+-- every CC capture already processed ('ok' or 'nodata'); warc_fetch --skip-db
+-- reads this so captures without product data are not re-fetched each drain
+CREATE TABLE IF NOT EXISTS cc_done(
+  url TEXT, capture_ts TEXT, status TEXT, merged_at TEXT,
+  PRIMARY KEY (url, capture_ts)
+);
 """
 
 
@@ -60,6 +66,18 @@ def part_rows(path):
             return []
         sel = ", ".join(c if c in have else "NULL" for c in COLS)
         return part.execute(f"select {sel} from warc_item").fetchall()
+    finally:
+        part.close()
+
+
+def part_done(path):
+    part = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        cols = {r[1] for r in part.execute("pragma table_info(done)")}
+        if not cols:
+            return []
+        st = "coalesce(status, 'ok')" if "status" in cols else "'ok'"
+        return part.execute(f"select url, capture_ts, {st} from done").fetchall()
     finally:
         part.close()
 
@@ -107,10 +125,15 @@ def main():
                         (rec["sku"] or rec["url"], rec["capture_ts"], rec["price"],
                          f"cc:{rec['digest'] or rec['capture_ts']}", "commoncrawl"))
                     n_hist += 1
+        with db:
+            db.executemany("insert or ignore into cc_done values(?,?,?,?)",
+                           [(u, t, st, NOW) for (u, t, st) in part_done(p)])
         n_item += added
         print(f"  {os.path.relpath(p, args.part_dir)}: {len(rows)} captures, +{added} new")
 
     total = db.execute("select count(*) from warc_item").fetchone()[0]
+    nodata = db.execute("select count(*) from cc_done where status='nodata'").fetchone()[0]
+    print(f"cc_done: {db.execute('select count(*) from cc_done').fetchone()[0]} (nodata {nodata})")
     db.close()
     print(f"done: parts={len(parts)} bad={bad} part_rows={seen_total} "
           f"new_warc_item={n_item} new_price_history={n_hist} warc_item_total={total}")
