@@ -147,6 +147,19 @@ Provenance note: capture_ts is the ARCHIVE time, not our fetch time — every
 historical row is attributable to its crawl. Zero kilimall.co.ke requests
 across ALL phases.
 
+## Incident 2026-11-17 — Actions artifact egress cap (resolved)
+
+The 11:33 drain completed all 20 legs (~20k captures fetched fine), but the
+merge job's `gh run download` failed with `HTTP 503: Egress is over the account limit`.
+Only shard 16's part was retrievable — 1,029 captures made it into live-latest.
+Cause: artifact downloads/uploads draw on the account's Actions egress quota,
+which we'd blown with repeated full-matrix drains.
+
+Fix (merged `ab20c59`): legs themselves upload their part DBs as `cc-parts`
+release assets (`cc-part-NN.db.gz`, `live-part-N.db.gz`); the merge job and the
+30-min watchdog both download from `cc-parts`. Release assets don't draw on
+artifact egress. Watchdog + ci_merge_run are quota-safe.
+
 ## Autonomy posture (user away 2026-11-16 → ~11-18)
 
 - cc-drain legs exit 0 regardless of per-item outcome; artifacts upload with
