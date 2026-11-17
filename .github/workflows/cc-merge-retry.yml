@@ -34,8 +34,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          rid=$(gh run list --workflow cc-drain.yml --repo "$GITHUB_REPOSITORY" --limit 5 \
-                --json databaseId,status,createdAt --jq '[.[] | select(.status == "completed")] | .[0].databaseId // ""')
+          # newest drain run that actually SUCCEEDED (cancelled/failed runs have no usable artifacts)
+          rid=$(gh run list --workflow cc-drain.yml --repo "$GITHUB_REPOSITORY" --limit 10 \
+                --json databaseId,status,conclusion --jq '[.[] | select(.status == "completed" and .conclusion == "success")] | .[0].databaseId // ""')
           if [ -z "$rid" ]; then echo "no completed drain run yet — nothing to do"; echo "run_id=" >> "$GITHUB_OUTPUT"; exit 0; fi
           if git ls-remote --tags origin | grep -q "cc-merge-done-$rid\$"; then
             echo "run $rid already merged — nothing to do"; echo "run_id=" >> "$GITHUB_OUTPUT"; exit 0
@@ -101,12 +102,11 @@ jobs:
           s = sqlite3.connect(live); d = sqlite3.connect(cold)
           s.backup(d); d.execute("PRAGMA wal_checkpoint(TRUNCATE)"); d.close(); s.close()
           PY
+          [ "$n" -ge 1 ] || { echo "[guard] merge produced 0 warc_item rows — not publishing"; exit 1; }
           (cd data/cold && python -c "import zipfile; zipfile.ZipFile('../kilimall.db.zip','w',zipfile.ZIP_DEFLATED).write('kilimall.db')")
-          snap="data/snapshot-$(date +%F).parquet"
-          [ -f "$snap" ] || python -c "import duckdb,sys; duckdb.sql(\"copy (select * from sqlite_scan('data/kilimall.db','listings')) to 'data/kilimall-live-latest.parquet' (format parquet)\")"
-          cp "$snap" data/kilimall-live-latest.parquet 2>/dev/null || true
-          (cd data && sha256sum kilimall.db.zip kilimall-live-latest.parquet 2>/dev/null | sed 's/ .*\///' > SHA256SUMS || true)
-          gh release upload live-latest data/kilimall.db.zip kilimall-live-latest.parquet SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+          python -c "import duckdb; duckdb.sql(\"install sqlite; load sqlite; copy (select * from sqlite_scan('data/kilimall.db','listings')) to 'data/kilimall-live-latest.parquet' (format parquet)\")"
+          (cd data && sha256sum kilimall.db.zip kilimall-live-latest.parquet > SHA256SUMS)
+          gh release upload live-latest data/kilimall.db.zip data/kilimall-live-latest.parquet data/SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
 
       - name: Tag merge done
         if: steps.target.outputs.run_id != '' && env.has_data == 'true'
